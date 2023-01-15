@@ -19,6 +19,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -43,6 +44,10 @@ var (
 	connectTimeout = flag.Duration("connect-timeout", 1*time.Second, "Initial connection timeout")
 	clientTimeout  = flag.Duration("client-timeout", 2*time.Second, "Overall HTTP request timeout")
 	startupDelay   = flag.Uint("startup-delay", uint(0), "Number of milliseconds to delay before starting the requests.")
+	follow         = flag.Bool("follow", false, "Print results as they are available, rather than all at the end.")
+
+	pmu sync.Mutex
+	pw  *bufio.Writer = bufio.NewWriter(os.Stdout)
 )
 
 const (
@@ -51,6 +56,8 @@ const (
 )
 
 func main() {
+	defer pw.Flush()
+
 	// Set up usage function and parse command-line arguments
 	flag.Parse()
 
@@ -96,21 +103,24 @@ func main() {
 		time.Sleep(time.Duration(*startupDelay) * time.Millisecond)
 	}
 
-	// Output some information while requests are being run and data is being captured.
-	// Gives an indication of the amount of traffic that's occuring.
-	ticker := time.NewTicker(1 * time.Second) // 100 * time.Millisecond)
-	go func() {
-		report := func() {
-			rp, tp, rb, tb := bc.Sample()
-			// TODO: Improve the accuracy of this. It's Write()'s and Read()'s, not Packets.
-			fmt.Fprintln(os.Stderr, "Packets sent:", tp, "received", rp, "Bytes sent:", tb, "bytes received:", rb)
-		}
+	var ticker *time.Ticker
+	if !*follow {
+		// Output some information while requests are being run and data is being captured.
+		// Gives an indication of the amount of traffic that's occuring.
+		ticker = time.NewTicker(1 * time.Second)
+		go func() {
+			report := func() {
+				rp, tp, rb, tb := bc.Sample()
+				// TODO: Improve the accuracy of this. It's Write()'s and Read()'s, not Packets.
+				fmt.Fprintln(os.Stderr, "Packets sent:", tp, "received", rp, "Bytes sent:", tb, "bytes received:", rb)
+			}
 
-		for range ticker.C {
+			for range ticker.C {
+				report()
+			}
 			report()
-		}
-		report()
-	}()
+		}()
+	}
 
 	// Set up traffic rate
 	limiter := rate.NewLimiter(rate.Limit(*requestRate), 1)
@@ -176,53 +186,67 @@ func main() {
 			}
 			// Capture end timestamp for this session
 			s.completed = time.Now()
+			if *follow {
+				pmu.Lock()
+				outputSession(s)
+				pmu.Unlock()
+			}
 		}()
 
 	}
 	// Wait for goroutines to finish.
 	wg.Wait()
 	// Stop reporting information
-	ticker.Stop()
-
-	// Summary headers
-	fmt.Printf("Session\tStartTime")
-	for i := range urls {
-		fmt.Printf("\tC%[1]dConnSetup\tC%[1]dReqSent\tC%[1]dRespStarted\tC%[1]dRespCompleted", i+1)
+	if ticker != nil {
+		ticker.Stop()
 	}
-	fmt.Printf("\tDuration\n")
+
+	if !*follow {
+		output(urls, uuidList, st.m)
+	}
+}
+
+func output(urls []string, uuidList []string, m map[string]*session) {
+	// Summary headers
+	fmt.Fprintf(pw, "Session\tStartTime")
+	for i := range urls {
+		fmt.Fprintf(pw, "\tC%[1]dConnSetup\tC%[1]dReqSent\tC%[1]dRespStarted\tC%[1]dRespCompleted", i+1)
+	}
+	fmt.Fprintf(pw, "\tDuration\n")
 
 	// Output the data collected for all the sessions.
 	// This should be redirected to a file for large numbers of requests.
 	for _, v := range uuidList {
-		s := st.m[v]
-
-		fmt.Printf("%s\t%d", s.uuid, s.initiated.UnixNano())
-		for _, c := range s.connections {
-			connSetup := c.established.Sub(c.started)
-			if connSetup < 0 {
-				connSetup = 0
-			}
-			reqSent := c.firstWrite.ts.Sub(c.established)
-			if reqSent < 0 {
-				reqSent = 0
-			}
-			respStarted := c.firstRead.ts.Sub(c.established)
-			if respStarted < 0 {
-				respStarted = 0
-			}
-			respCompleted := c.closed.ts.Sub(c.established)
-			if respCompleted < 0 {
-				respCompleted = 0
-			}
-			fmt.Printf("\t%d\t%d\t%d\t%d", connSetup, reqSent, respStarted, respCompleted)
-		}
-		dur := s.completed.Sub(s.initiated)
-		if dur < 0 {
-			dur = 0
-		}
-		fmt.Printf("\t%d\n", dur)
-
+		outputSession(m[v])
 	}
+}
+
+func outputSession(s *session) {
+	fmt.Fprintf(pw, "%s\t%d", s.uuid, s.initiated.UnixNano())
+	for _, c := range s.connections {
+		connSetup := c.established.Sub(c.started)
+		if connSetup < 0 {
+			connSetup = 0
+		}
+		reqSent := c.firstWrite.ts.Sub(c.established)
+		if reqSent < 0 {
+			reqSent = 0
+		}
+		respStarted := c.firstRead.ts.Sub(c.established)
+		if respStarted < 0 {
+			respStarted = 0
+		}
+		respCompleted := c.closed.ts.Sub(c.established)
+		if respCompleted < 0 {
+			respCompleted = 0
+		}
+		fmt.Fprintf(pw, "\t%d\t%d\t%d\t%d", connSetup, reqSent, respStarted, respCompleted)
+	}
+	dur := s.completed.Sub(s.initiated)
+	if dur < 0 {
+		dur = 0
+	}
+	fmt.Fprintf(pw, "\t%d\n", dur)
 }
 
 // session represents a UUID, and a list of URLs that will be requested.
